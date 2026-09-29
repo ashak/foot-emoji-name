@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Show the name of an emoji foot matched, in a desktop notification.
+
+Invoked by foot's [regex:emoji] label mode: press Control+Shift+e, then the
+label letter next to the emoji you want. foot passes the matched text as argv[1].
+
+Names come from the emoji database that ships with omarchy (the same one its
+emoji picker uses), so there is no network access and nothing to install.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+
+DB_PATH = os.environ.get(
+    "FOOT_EMOJI_DB",
+    "/usr/share/omarchy/shell/plugins/emojis/emojis.json",
+)
+NOTIFY_BIN = os.environ.get("FOOT_EMOJI_NOTIFIER", "omarchy-notification-send")
+EMOJI_FONT = "Noto Color Emoji"
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "foot-emoji-name",
+)
+NOTIFY_TIMEOUT_MS = "6000"
+GLYPH = "\U0001f50e"  # left-pointing magnifying glass, marks the toast as ours
+
+# U+1F3FB..U+1F3FF skin-tone modifiers. The database has no toned variants, so
+# a toned emoji is looked up by its base form.
+SKIN_TONE = re.compile("[\U0001F3FB-\U0001F3FF]")
+
+# The database stores each name as one search blob that mixes the display name
+# with a snake_case shortcode ("white_check_mark check mark button"). The
+# shortcode is the form an emoji picker wants to search, not the form a person
+# wants to read, so it is dropped from the displayed name.
+SHORTCODE = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)+")
+
+
+def load_db():
+    try:
+        with open(DB_PATH, encoding="utf-8") as fp:
+            return {item["e"]: item["k"] for item in json.load(fp)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def name_words(db, text):
+    """Human-readable words describing text, best effort, never None-ish."""
+    blob = db.get(text) or db.get(SKIN_TONE.sub("", text))
+    if blob:
+        words, seen = [], set()
+        for token in blob.split():
+            if SHORTCODE.fullmatch(token):
+                continue
+            word = token.lower().strip(":,.+")
+            if word and word not in seen:
+                seen.add(word)
+                words.append(word)
+        if words:
+            return words
+
+    # Not in the database. Fall back to the Unicode character name; that is a
+    # TypeError-free lookup failure for the ZWJ and skin-tone sequences that
+    # have no single code point.
+    try:
+        return [unicodedata.name(text).lower()]
+    except ValueError:
+        parts = [unicodedata.name(c) for c in text if unicodedata.name(c, "")]
+        if parts:
+            return [" + ".join(parts).lower()]
+    return []
+
+
+def shortcode_for(db, text):
+    """The snake_case form, which is searchable in omarchy's emoji picker."""
+    blob = db.get(text) or db.get(SKIN_TONE.sub("", text)) or ""
+    for token in blob.split():
+        if SHORTCODE.fullmatch(token):
+            return token
+    return ""
+
+
+def codepoints(text):
+    return " ".join("U+%04X" % ord(c) for c in text)
+
+
+def clamp(name, limit=40):
+    """Trim to limit characters, cutting on a word boundary.
+
+    Names in the database run up to 10 words / 61 characters. Cutting on whole
+    words keeps the toast's summary line readable, which a raw string slice
+    ("smiling face with heart-") does not.
+    """
+    if len(name) <= limit:
+        return name
+    kept = []
+    used = 0
+    for word in name.split():
+        added = len(word) + (1 if kept else 0)
+        if used + added > limit:
+            break
+        kept.append(word)
+        used += added
+    return " ".join(kept) + "\u2026"
+
+
+def render_png(text):
+    """Draw text with the colour emoji font, trimmed to a square PNG."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = "U+" + "-".join("%04X" % ord(c) for c in text)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    out = os.path.join(CACHE_DIR, safe + ".png")
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        return out
+
+    raw = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="foot-emoji-name.") as tmp:
+            raw = os.path.join(tmp, "raw.png")
+            # A wide canvas keeps a single emoji from wrapping to a second line,
+            # which would trim into a two-emoji image.
+            subprocess.run(
+                [
+                    "pango-view",
+                    "--no-display",
+                    "--font=%s 200" % EMOJI_FONT,
+                    "--width=2000",
+                    "--margin=0",
+                    "--output=" + raw,
+                    "--text=" + text,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            # Trim to the glyph's ink, then pad back to a square so the toast's
+            # 40px slot scales it without distorting.
+            subprocess.run(
+                [
+                    "magick", raw,
+                    "-trim", "+repage",
+                    "-resize", "200x200",
+                    "-background", "none",
+                    "-gravity", "center",
+                    "-extent", "200x200",
+                    out,
+                ],
+                check=True,
+                capture_output=True,
+            )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        return out
+    return ""
+
+
+def main():
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        return 1
+    text = sys.argv[1]
+
+    db = load_db()
+    words = name_words(db, text)
+    name = clamp(" ".join(words)) if words else "unnamed symbol"
+
+    body = codepoints(text)
+    short = shortcode_for(db, text)
+    if short:
+        body += "  \u00b7  :" + short + ":"
+
+    cmd = [
+        NOTIFY_BIN,
+        "--app-name", "foot",
+        "-g", GLYPH,
+        "-t", NOTIFY_TIMEOUT_MS,
+    ]
+    png = render_png(text)
+    if png:
+        cmd += ["--image", "file://" + png]
+    cmd += [name, body]
+
+    try:
+        subprocess.run(cmd, check=False)
+    except OSError:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
