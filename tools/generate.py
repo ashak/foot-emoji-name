@@ -137,6 +137,11 @@ def main():
         "[key-bindings]\n"
         "regex-launch=[emoji] " + args.keybinding + "\n"
     )
+    # foot's config directory may not exist yet on a machine that has never
+    # started foot, so create it rather than failing with ENOENT.
+    parent = os.path.dirname(out)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(out, "w", encoding="utf-8") as fp:
         fp.write(header)
     print("wrote %s (%d chars)" % (out, len(pattern)))
